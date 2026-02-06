@@ -13,6 +13,7 @@ from confidence import confidence_score
 
 from ta.volatility import AverageTrueRange
 from ta.volume import VolumeWeightedAveragePrice
+from scipy.stats import linregress
 
 load_dotenv()
 
@@ -31,89 +32,49 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 def market_is_open():
     eastern = pytz.timezone("US/Eastern")
     now = datetime.now(eastern)
+
     if now.weekday() >= 5:
         return False
-    return time(9,30) <= now.time() <= time(16,0)
 
-# ---------------- INDICATORS ---------------- #
+    open_time = time(9, 30)
+    close_time = time(16, 0)
+
+    return open_time <= now.time() <= close_time
+
+# ---------------- ADVANCED INDICATORS ---------------- #
 
 def calculate_support_resistance(df):
-    return round(df["Low"].tail(20).min(),2), round(df["High"].tail(20).max(),2)
-
-def supply_demand_zones(df):
-    recent = df.tail(50)
-    return round(recent["Low"].min(),2), round(recent["High"].max(),2)
+    support = round(df["Low"].tail(20).min(), 2)
+    resistance = round(df["High"].tail(20).max(), 2)
+    return support, resistance
 
 def detect_fvg(df):
-    for i in range(len(df)-2, 2, -1):
-        if df["High"].iloc[i-2] < df["Low"].iloc[i]:
+    for i in range(2, len(df)):
+        high1 = df["High"].iloc[i-2]
+        low3 = df["Low"].iloc[i]
+        if high1 < low3:
             return "Bullish FVG"
-        if df["Low"].iloc[i-2] > df["High"].iloc[i]:
+        low1 = df["Low"].iloc[i-2]
+        high3 = df["High"].iloc[i]
+        if low1 > high3:
             return "Bearish FVG"
-    return "None"
-
-def detect_liquidity_sweep(df):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    if last["Low"] < prev["Low"] and last["Close"] > prev["Low"]:
-        return "Bullish Liquidity Sweep"
-    if last["High"] > prev["High"] and last["Close"] < prev["High"]:
-        return "Bearish Liquidity Sweep"
-    return "None"
-
-def detect_break_retest(df):
-    support, resistance = calculate_support_resistance(df)
-    last_close = df["Close"].iloc[-1]
-
-    if last_close > resistance:
-        return "Breakout"
-    elif last_close < support:
-        return "Breakdown"
-    else:
-        return "Retest Zone"
+    return None
 
 def trend_strength(df):
-    highs = df["High"].tail(10)
-    lows = df["Low"].tail(10)
-    if highs.is_monotonic_increasing:
-        return "Strong Bullish 📈"
-    elif lows.is_monotonic_decreasing:
-        return "Strong Bearish 📉"
-    return "Neutral ⚖️"
+    highs = df["High"].tail(20).values
+    lows = df["Low"].tail(20).values
 
-def confluence_score(confidence, fvg, liquidity, trend):
-    score = confidence
-    if fvg != "None":
-        score += 5
-    if liquidity != "None":
-        score += 5
-    if "Strong" in trend:
-        score += 5
-    return min(score, 100)
+    high_slope = linregress(range(len(highs)), highs).slope
+    low_slope = linregress(range(len(lows)), lows).slope
 
-def grade_trade(score):
-    if score >= 90:
-        return "A+ 🔥"
-    elif score >= 80:
-        return "A ✅"
-    elif score >= 70:
-        return "B ⚠️"
+    if high_slope > 0 and low_slope > 0:
+        return "Strong Bullish"
+    elif high_slope < 0 and low_slope < 0:
+        return "Strong Bearish"
     else:
-        return "C ❌"
+        return "Neutral"
 
-def ai_summary(symbol, direction, trend, fvg, liquidity, break_retest, score):
-    return (
-        f"🤖 **AI Confirmation**\n"
-        f"Trend: {trend}\n"
-        f"Liquidity: {liquidity}\n"
-        f"FVG: {fvg}\n"
-        f"Structure: {break_retest}\n"
-        f"Confluence Score: {score}/100\n"
-        f"Bias favors {direction} setup."
-    )
-
-# ---------------- TRADE EMBED ---------------- #
+# ---------------- MAIN EMBED ---------------- #
 
 async def generate_trade_embed(symbol):
     df = get_stock_df(symbol)
@@ -127,7 +88,12 @@ async def generate_trade_embed(symbol):
     calls, puts, expiry = get_option_chain(symbol)
     price = round(df["Close"].iloc[-1], 2)
 
-    option = filter_options(calls if direction=="CALL" else puts, direction, price)
+    option = filter_options(
+        calls if direction == "CALL" else puts,
+        direction,
+        price
+    )
+
     if option is None:
         return None
 
@@ -137,61 +103,69 @@ async def generate_trade_embed(symbol):
 
     atr = AverageTrueRange(df["High"], df["Low"], df["Close"]).average_true_range().iloc[-1]
 
-    vwap = round(
-        VolumeWeightedAveragePrice(df["High"], df["Low"], df["Close"], df["Volume"]).vwap.iloc[-1],2
+    vwap_indicator = VolumeWeightedAveragePrice(
+        high=df["High"], low=df["Low"], close=df["Close"], volume=df["Volume"]
     )
+    vwap = round(vwap_indicator.vwap.iloc[-1], 2)
 
     support, resistance = calculate_support_resistance(df)
-    demand, supply = supply_demand_zones(df)
     fvg = detect_fvg(df)
-    liquidity = detect_liquidity_sweep(df)
-    break_retest = detect_break_retest(df)
     trend = trend_strength(df)
 
-    score = confluence_score(confidence, fvg, liquidity, trend)
-    grade = grade_trade(score)
-
-    summary = ai_summary(symbol, direction, trend, fvg, liquidity, break_retest, score)
-
+    # Trade levels
     if direction == "CALL":
         entry = price
-        target = round(price + atr*1.5,2)
-        stop = round(price - atr,2)
-        emoji="🟢📈"
-        label=f"${symbol} ${int(option['strike'])}C"
-        color=discord.Color.green()
+        target = round(price + atr * 1.5, 2)
+        stop = round(price - atr, 2)
+        emoji = "🟢📈"
+        option_label = f"${symbol} ${int(option['strike'])}C"
     else:
         entry = price
-        target = round(price - atr*1.5,2)
-        stop = round(price + atr,2)
-        emoji="🔴📉"
-        label=f"${symbol} ${int(option['strike'])}P"
-        color=discord.Color.red()
+        target = round(price - atr * 1.5, 2)
+        stop = round(price + atr, 2)
+        emoji = "🔴📉"
+        option_label = f"${symbol} ${int(option['strike'])}P"
 
-    embed = discord.Embed(title=f"{emoji} {label}", color=color)
+    # Build confluence list
+    confluences = []
 
-    embed.add_field(name="Trade Grade", value=grade, inline=True)
-    embed.add_field(name="Confidence", value=f"{confidence}%", inline=True)
-    embed.add_field(name="Confluence Score", value=f"{score}/100", inline=True)
+    if price > vwap and direction == "CALL":
+        confluences.append("Above VWAP")
+    if price < vwap and direction == "PUT":
+        confluences.append("Below VWAP")
 
-    embed.add_field(name="VWAP", value=str(vwap), inline=True)
+    if fvg:
+        confluences.append(fvg)
+
+    confluences.append(f"Trend: {trend}")
+
+    if direction == "CALL":
+        confluences.append(f"Demand zone near ${support}")
+    else:
+        confluences.append(f"Supply zone near ${resistance}")
+
+    confluence_text = "\n".join([f"• {c}" for c in confluences[:4]])
+
+    embed = discord.Embed(
+        title=f"{emoji} {option_label}",
+        color=discord.Color.green() if direction == "CALL" else discord.Color.red()
+    )
+
     embed.add_field(name="Entry", value=f"${entry}", inline=True)
     embed.add_field(name="Target", value=f"${target}", inline=True)
-    embed.add_field(name="Stop Loss", value=f"${stop}", inline=True)
+    embed.add_field(name="Stop", value=f"${stop}", inline=True)
+    embed.add_field(name="Confidence", value=f"{confidence}%", inline=True)
 
-    embed.add_field(name="Support", value=f"${support}", inline=True)
-    embed.add_field(name="Resistance", value=f"${resistance}", inline=True)
-    embed.add_field(name="Demand Zone", value=f"${demand}", inline=True)
-    embed.add_field(name="Supply Zone", value=f"${supply}", inline=True)
+    embed.add_field(name="Confluence", value=confluence_text, inline=False)
 
-    embed.add_field(name="FVG", value=fvg, inline=True)
-    embed.add_field(name="Liquidity Sweep", value=liquidity, inline=True)
-    embed.add_field(name="Structure", value=break_retest, inline=True)
-    embed.add_field(name="Trend Strength", value=trend, inline=False)
-    embed.add_field(name="AI Confirmation", value=summary, inline=False)
+    embed.add_field(
+        name="AI Confirmation",
+        value=f"High probability {direction} setup based on multi-indicator confluence.",
+        inline=False
+    )
 
-    embed.timestamp = datetime.now(pytz.utc)
     embed.set_footer(text="⚠️ Educational use only")
+    embed.timestamp = datetime.now(timezone.utc)
 
     return embed
 
@@ -199,7 +173,7 @@ async def generate_trade_embed(symbol):
 
 @bot.event
 async def on_ready():
-    print("🔥 PRO VERSION DEPLOYED 🔥")
+    print("🔥 BOT ONLINE 🔥")
     fast_alerts.start()
     slow_alerts.start()
 
@@ -208,21 +182,26 @@ async def on_ready():
 @bot.command()
 async def play(ctx, symbol: str):
     if not market_is_open():
-        await ctx.send("⏰ Market closed.")
+        await ctx.send("⏰ Market is closed (9:30am–4:00pm ET).")
         return
 
     embed = await generate_trade_embed(symbol.upper())
     if embed:
         await ctx.send(embed=embed)
     else:
-        await ctx.send("⚠️ No high-quality setup found.")
+        await ctx.send(f"⚠️ No high-quality setup for {symbol.upper()}")
 
 # ---------------- AUTO TASKS ---------------- #
 
 @tasks.loop(minutes=15)
 async def fast_alerts():
-    if not market_is_open(): return
+    if not market_is_open():
+        return
+
     channel = bot.get_channel(CHANNEL_ID)
+    if not channel:
+        return
+
     for symbol in FAST_WATCHLIST:
         embed = await generate_trade_embed(symbol)
         if embed:
@@ -230,8 +209,13 @@ async def fast_alerts():
 
 @tasks.loop(minutes=30)
 async def slow_alerts():
-    if not market_is_open(): return
+    if not market_is_open():
+        return
+
     channel = bot.get_channel(CHANNEL_ID)
+    if not channel:
+        return
+
     for symbol in SLOW_WATCHLIST:
         embed = await generate_trade_embed(symbol)
         if embed:
