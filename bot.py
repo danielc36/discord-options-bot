@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import os
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 import pytz
 import pandas as pd
 
