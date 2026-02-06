@@ -1,7 +1,8 @@
 discord.py
+python-dotenv
 yfinance
 pandas
 numpy
 ta
-python-dotenv
+matplotlib
 pytz
