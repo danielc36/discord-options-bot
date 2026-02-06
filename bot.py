@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 import os
 from datetime import datetime, time, timezone
 import pytz
-import pandas as pd
+import matplotlib.pyplot as plt
 
 from market import get_stock_df, get_option_chain
 from strategy import analyze_trend
@@ -47,19 +47,48 @@ def calculate_support_resistance(df):
     resistance = round(df["High"].tail(20).max(), 2)
     return support, resistance
 
+
 def ai_summary(symbol, direction, price, vwap, support, resistance, confidence):
     if direction == "CALL":
         return (
-            f"🤖 **AI Summary:** {symbol} is trading above VWAP with bullish momentum. "
-            f"Support near ${support} is holding and price is targeting resistance at ${resistance}. "
-            f"Confidence score of {confidence}% supports a CALL setup."
+            f"🤖 {symbol} above VWAP with bullish momentum. "
+            f"Support at ${support} holding, targeting resistance ${resistance}. "
+            f"Confidence {confidence}% confirms CALL setup."
         )
     else:
         return (
-            f"🤖 **AI Summary:** {symbol} is trading below VWAP with bearish momentum. "
-            f"Resistance near ${resistance} is holding and price is targeting support at ${support}. "
-            f"Confidence score of {confidence}% supports a PUT setup."
+            f"🤖 {symbol} below VWAP with bearish momentum. "
+            f"Resistance at ${resistance} holding, targeting support ${support}. "
+            f"Confidence {confidence}% confirms PUT setup."
         )
+
+
+def trend_strength_score(price, vwap, atr, confidence):
+    distance = abs(price - vwap)
+    strength = (distance / atr) * 50 + confidence * 0.5
+    return min(round(strength, 1), 100)
+
+
+def generate_chart(symbol, df, support, resistance, vwap):
+    plt.figure(figsize=(6,4))
+    prices = df["Close"].tail(50)
+
+    plt.plot(prices, label="Price", linewidth=2)
+    plt.axhline(support, linestyle="--", label="Support")
+    plt.axhline(resistance, linestyle="--", label="Resistance")
+    plt.axhline(vwap, linestyle="--", label="VWAP")
+
+    plt.title(symbol)
+    plt.legend()
+    plt.tight_layout()
+
+    filename = f"{symbol}_chart.png"
+    plt.savefig(filename)
+    plt.close()
+
+    return filename
+
+# ---------------- TRADE EMBED ---------------- #
 
 async def generate_trade_embed(symbol):
     df = get_stock_df(symbol)
@@ -78,7 +107,6 @@ async def generate_trade_embed(symbol):
         direction,
         price
     )
-
     if option is None:
         return None
 
@@ -86,14 +114,12 @@ async def generate_trade_embed(symbol):
     if confidence < 70:
         return None
 
-    # ATR
     atr = AverageTrueRange(
         high=df["High"],
         low=df["Low"],
         close=df["Close"]
     ).average_true_range().iloc[-1]
 
-    # VWAP
     vwap_indicator = VolumeWeightedAveragePrice(
         high=df["High"],
         low=df["Low"],
@@ -104,6 +130,10 @@ async def generate_trade_embed(symbol):
 
     support, resistance = calculate_support_resistance(df)
     summary = ai_summary(symbol, direction, price, vwap, support, resistance, confidence)
+    strength = trend_strength_score(price, vwap, atr, confidence)
+
+    chart_file = generate_chart(symbol, df, support, resistance, vwap)
+    file = discord.File(chart_file, filename="chart.png")
 
     if direction == "CALL":
         entry = round(price, 2)
@@ -120,18 +150,14 @@ async def generate_trade_embed(symbol):
         option_label = f"${symbol} ${int(option['strike'])}P"
         color = discord.Color.red()
 
-    embed = discord.Embed(
-        title=f"{emoji} {option_label}",
-        color=color
-    )
-
-    # ✅ TIMESTAMP GOES HERE
+    embed = discord.Embed(title=f"{emoji} {option_label}", color=color)
     embed.timestamp = datetime.now(timezone.utc)
 
     embed.add_field(name="Expiration", value=str(expiry), inline=True)
     embed.add_field(name="Confidence", value=f"{confidence}%", inline=True)
-    embed.add_field(name="VWAP", value=str(vwap), inline=True)
+    embed.add_field(name="Trend Strength", value=f"{strength}/100", inline=True)
 
+    embed.add_field(name="VWAP", value=f"${vwap}", inline=True)
     embed.add_field(name="Best Entry", value=f"${entry}", inline=True)
     embed.add_field(name="Target", value=f"${target}", inline=True)
     embed.add_field(name="Stop Loss", value=f"${stop}", inline=True)
@@ -140,30 +166,21 @@ async def generate_trade_embed(symbol):
     embed.add_field(name="Resistance", value=f"${resistance}", inline=True)
     embed.add_field(name="ATR", value=round(atr, 2), inline=True)
 
-    embed.add_field(
-        name="AI Confirmation",
-        value=summary,
-        inline=False
-    )
+    embed.add_field(name="AI Confirmation", value=summary, inline=False)
 
+    embed.set_image(url="attachment://chart.png")
     embed.set_footer(text="⚠️ Educational use only")
 
-    return embed
-
+    return embed, file
 
 # ---------------- EVENTS ---------------- #
 
 @bot.event
 async def on_ready():
-    print("🔥 NEW VERSION DEPLOYED 🔥")
+    print("🔥 BOT ONLINE 🔥")
     print(f"Logged in as {bot.user}")
-
-    if not fast_alerts.is_running():
-        fast_alerts.start()
-
-    if not slow_alerts.is_running():
-        slow_alerts.start()
-
+    fast_alerts.start()
+    slow_alerts.start()
 
 # ---------------- COMMAND ---------------- #
 
@@ -173,15 +190,12 @@ async def play(ctx, symbol: str):
         await ctx.send("⏰ Market is closed (9:30am–4:00pm ET).")
         return
 
-    try:
-        embed = await generate_trade_embed(symbol.upper())
-        if embed:
-            await ctx.send(embed=embed)
-        else:
-            await ctx.send(f"⚠️ No high-quality setup for {symbol.upper()}")
-    except Exception as e:
-        await ctx.send("❌ Error generating trade setup.")
-        print(e)
+    result = await generate_trade_embed(symbol.upper())
+    if result:
+        embed, file = result
+        await ctx.send(embed=embed, file=file)
+    else:
+        await ctx.send(f"⚠️ No high-quality setup for {symbol.upper()}")
 
 # ---------------- AUTO TASKS ---------------- #
 
@@ -195,12 +209,11 @@ async def fast_alerts():
         return
 
     for symbol in FAST_WATCHLIST:
-        try:
-            embed = await generate_trade_embed(symbol)
-            if embed:
-                await channel.send(embed=embed)
-        except Exception as e:
-            print(f"Fast loop error {symbol}: {e}")
+        result = await generate_trade_embed(symbol)
+        if result:
+            embed, file = result
+            await channel.send(embed=embed, file=file)
+
 
 @tasks.loop(minutes=30)
 async def slow_alerts():
@@ -212,11 +225,9 @@ async def slow_alerts():
         return
 
     for symbol in SLOW_WATCHLIST:
-        try:
-            embed = await generate_trade_embed(symbol)
-            if embed:
-                await channel.send(embed=embed)
-        except Exception as e:
-            print(f"Slow loop error {symbol}: {e}")
+        result = await generate_trade_embed(symbol)
+        if result:
+            embed, file = result
+            await channel.send(embed=embed, file=file)
 
 bot.run(TOKEN)
