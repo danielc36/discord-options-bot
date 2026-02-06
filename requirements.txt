@@ -6,3 +6,4 @@ numpy
 ta
 matplotlib
 pytz
+scipy
