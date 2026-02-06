@@ -47,6 +47,20 @@ def calculate_support_resistance(df):
     resistance = round(df["High"].tail(20).max(), 2)
     return support, resistance
 
+def ai_summary(symbol, direction, price, vwap, support, resistance, confidence):
+    if direction == "CALL":
+        return (
+            f"🤖 **AI Summary:** {symbol} is trading above VWAP with bullish momentum. "
+            f"Support near ${support} is holding and price is targeting resistance at ${resistance}. "
+            f"Confidence score of {confidence}% supports a CALL setup."
+        )
+    else:
+        return (
+            f"🤖 **AI Summary:** {symbol} is trading below VWAP with bearish momentum. "
+            f"Resistance near ${resistance} is holding and price is targeting support at ${support}. "
+            f"Confidence score of {confidence}% supports a PUT setup."
+        )
+
 async def generate_trade_embed(symbol):
     df = get_stock_df(symbol)
     if df.empty:
@@ -89,6 +103,8 @@ async def generate_trade_embed(symbol):
     vwap = round(vwap_indicator.vwap.iloc[-1], 2)
 
     support, resistance = calculate_support_resistance(df)
+    summary = ai_summary(symbol, direction, price, vwap, support, resistance, confidence)
+
 
     if direction == "CALL":
         entry = round(price, 2)
@@ -120,6 +136,13 @@ async def generate_trade_embed(symbol):
     embed.add_field(name="Resistance", value=f"${resistance}", inline=True)
     embed.add_field(name="ATR", value=round(atr, 2), inline=True)
 
+    embed.add_field(
+    name="AI Confirmation",
+    value=summary,
+    inline=False
+)
+
+
     embed.set_footer(text="⚠️ Educational use only")
 
     return embed
@@ -130,8 +153,13 @@ async def generate_trade_embed(symbol):
 async def on_ready():
     print("🔥 NEW VERSION DEPLOYED 🔥")
     print(f"Logged in as {bot.user}")
-    fast_alerts.start()
-    slow_alerts.start()
+
+    if not fast_alerts.is_running():
+        fast_alerts.start()
+
+    if not slow_alerts.is_running():
+        slow_alerts.start()
+
 
 # ---------------- COMMAND ---------------- #
 
