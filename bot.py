@@ -2,6 +2,8 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 import os
+from datetime import datetime
+import pytz
 
 from market import get_stock_df, get_option_chain
 from strategy import analyze_trend
@@ -14,12 +16,31 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+def market_is_open():
+    eastern = pytz.timezone("US/Eastern")
+    now = datetime.now(eastern)
+
+    if now.weekday() >= 5:  # Saturday/Sunday
+        return False
+
+    open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
+
+    return open_time <= now <= close_time
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
 
+
 @bot.command()
 async def play(ctx, symbol: str):
+
+    if not market_is_open():
+        await ctx.send("⏰ Market is closed. Try again during market hours (9:30am–4:00pm ET).")
+        return
+
     symbol = symbol.upper()
 
     df = get_stock_df(symbol)
@@ -60,5 +81,6 @@ Confidence: **{confidence}%**
 ⚠️ Educational use only
 """
     )
+
 
 bot.run(os.getenv("DISCORD_TOKEN"))
