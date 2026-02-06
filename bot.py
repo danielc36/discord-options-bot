@@ -105,24 +105,28 @@ async def generate_trade_embed(symbol):
     support, resistance = calculate_support_resistance(df)
     summary = ai_summary(symbol, direction, price, vwap, support, resistance, confidence)
 
-
     if direction == "CALL":
         entry = round(price, 2)
         target = round(price + atr * 1.5, 2)
         stop = round(price - atr, 2)
         emoji = "🟢📈"
         option_label = f"${symbol} ${int(option['strike'])}C"
+        color = discord.Color.green()
     else:
         entry = round(price, 2)
         target = round(price - atr * 1.5, 2)
         stop = round(price + atr, 2)
         emoji = "🔴📉"
         option_label = f"${symbol} ${int(option['strike'])}P"
+        color = discord.Color.red()
 
     embed = discord.Embed(
         title=f"{emoji} {option_label}",
-        color=discord.Color.green() if direction == "CALL" else discord.Color.red()
+        color=color
     )
+
+    # ✅ TIMESTAMP GOES HERE
+    embed.timestamp = datetime.now(timezone.utc)
 
     embed.add_field(name="Expiration", value=str(expiry), inline=True)
     embed.add_field(name="Confidence", value=f"{confidence}%", inline=True)
@@ -137,15 +141,15 @@ async def generate_trade_embed(symbol):
     embed.add_field(name="ATR", value=round(atr, 2), inline=True)
 
     embed.add_field(
-    name="AI Confirmation",
-    value=summary,
-    inline=False
-)
-
+        name="AI Confirmation",
+        value=summary,
+        inline=False
+    )
 
     embed.set_footer(text="⚠️ Educational use only")
 
     return embed
+
 
 # ---------------- EVENTS ---------------- #
 
