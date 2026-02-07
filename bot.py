@@ -3,222 +3,237 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import os
 from datetime import datetime, time, timezone
+import discord
+from discord.ext import commands, tasks
+import os
+from dotenv import load_dotenv
+from datetime import datetime
 import pytz
 import pandas as pd
-
-from market import get_stock_df, get_option_chain
-from strategy import analyze_trend
-from options import filter_options
-from confidence import confidence_score
-
-from ta.volatility import AverageTrueRange
-from ta.volume import VolumeWeightedAveragePrice
+import numpy as np
 from scipy.stats import linregress
+import joblib
+
+from market import get_stock_df
+
+from ta.volatility import BollingerBands, AverageTrueRange
+from ta.trend import ADXIndicator, IchimokuIndicator
+from ta.momentum import StochasticOscillator
+from ta.volume import VolumeWeightedAveragePrice
+
+# ---------------- LOAD ENV ---------------- #
 
 load_dotenv()
-
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
-FAST_WATCHLIST = ["SPY", "QQQ", "IWM"]
-SLOW_WATCHLIST = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA"]
-
 intents = discord.Intents.default()
-intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+SYMBOL = "SPY"
+ACTIVE_TRADE = None
+MODEL = joblib.load("model.pkl")  # ML model
+
+eastern = pytz.timezone("US/Eastern")
 
 # ---------------- MARKET HOURS ---------------- #
 
 def market_is_open():
-    eastern = pytz.timezone("US/Eastern")
     now = datetime.now(eastern)
-
     if now.weekday() >= 5:
         return False
+    return (now.hour > 9 or (now.hour == 9 and now.minute >= 30)) and now.hour < 16
 
-    open_time = time(9, 30)
-    close_time = time(16, 0)
+# ---------------- INDICATORS ---------------- #
 
-    return open_time <= now.time() <= close_time
+def apply_indicators(df):
+    bb = BollingerBands(df["Close"])
+    df["bb_high"] = bb.bollinger_hband()
+    df["bb_low"] = bb.bollinger_lband()
 
-# ---------------- ADVANCED INDICATORS ---------------- #
+    stoch = StochasticOscillator(df["High"], df["Low"], df["Close"])
+    df["stoch"] = stoch.stoch()
 
-def calculate_support_resistance(df):
-    support = round(df["Low"].tail(20).min(), 2)
-    resistance = round(df["High"].tail(20).max(), 2)
-    return support, resistance
+    adx = ADXIndicator(df["High"], df["Low"], df["Close"])
+    df["adx"] = adx.adx()
+
+    ichi = IchimokuIndicator(df["High"], df["Low"])
+    df["ichimoku"] = ichi.ichimoku_base_line()
+
+    vwap = VolumeWeightedAveragePrice(df["High"], df["Low"], df["Close"], df["Volume"])
+    df["vwap"] = vwap.vwap
+
+    df["atr"] = AverageTrueRange(df["High"], df["Low"], df["Close"]).average_true_range()
+
+    df.dropna(inplace=True)
+    return df
+
+# ---------------- PATTERN DETECTION ---------------- #
 
 def detect_fvg(df):
-    for i in range(2, len(df)):
-        high1 = df["High"].iloc[i-2]
-        low3 = df["Low"].iloc[i]
-        if high1 < low3:
-            return "Bullish FVG"
-        low1 = df["Low"].iloc[i-2]
-        high3 = df["High"].iloc[i]
-        if low1 > high3:
-            return "Bearish FVG"
-    return None
+    if len(df) < 3:
+        return 0
+    if df["Low"].iloc[-1] > df["High"].iloc[-3]:
+        return 1
+    if df["High"].iloc[-1] < df["Low"].iloc[-3]:
+        return -1
+    return 0
 
-def trend_strength(df):
-    highs = df["High"].tail(20).values
-    lows = df["Low"].tail(20).values
+def detect_wedge(df):
+    closes = df["Close"].tail(20).values
+    x = np.arange(len(closes))
+    slope, _, _, _, _ = linregress(x, closes)
+    return slope
 
-    high_slope = linregress(range(len(highs)), highs).slope
-    low_slope = linregress(range(len(lows)), lows).slope
+def detect_trendline_break(df):
+    closes = df["Close"].tail(20).values
+    x = np.arange(len(closes))
+    slope, intercept, _, _, _ = linregress(x, closes)
+    trendline = slope * x + intercept
+    return 1 if closes[-1] < trendline[-1] else 0
 
-    if high_slope > 0 and low_slope > 0:
-        return "Strong Bullish"
-    elif high_slope < 0 and low_slope < 0:
-        return "Strong Bearish"
-    else:
-        return "Neutral"
+# ---------------- FEATURE ENGINEERING ---------------- #
 
-# ---------------- MAIN EMBED ---------------- #
+def build_features(df1, df15):
+    price = df1["Close"].iloc[-1]
 
-async def generate_trade_embed(symbol):
-    df = get_stock_df(symbol)
-    if df.empty:
-        return None
+    features = [
+        price - df1["vwap"].iloc[-1],
+        df1["stoch"].iloc[-1],
+        df1["adx"].iloc[-1],
+        price - df1["ichimoku"].iloc[-1],
+        price - df1["bb_low"].iloc[-1],
+        detect_fvg(df1),
+        detect_wedge(df1),
+        detect_trendline_break(df1),
+        df15["adx"].iloc[-1],
+        df15["Close"].iloc[-1] - df15["vwap"].iloc[-1],
+        df1["atr"].iloc[-1],
+        df1["Volume"].iloc[-1]
+    ]
 
-    direction, df = analyze_trend(df)
-    if direction == "NO TRADE":
-        return None
+    return np.array(features).reshape(1, -1)
 
-    calls, puts, expiry = get_option_chain(symbol)
+# ---------------- CONFLUENCE TEXT ---------------- #
+
+def confluences(df):
+    conf = []
+    price = df["Close"].iloc[-1]
+
+    if price > df["vwap"].iloc[-1]:
+        conf.append("Above VWAP")
+    if df["stoch"].iloc[-1] < 20:
+        conf.append("Stoch Oversold")
+    if df["adx"].iloc[-1] > 20:
+        conf.append("Strong Trend (ADX)")
+    if price > df["ichimoku"].iloc[-1]:
+        conf.append("Above Ichimoku")
+    if detect_fvg(df) == 1:
+        conf.append("Bullish FVG")
+    if detect_trendline_break(df):
+        conf.append("Trendline Break")
+
+    return conf
+
+# ---------------- ENTRY CHECK ---------------- #
+
+def check_entry():
+    df1 = apply_indicators(get_stock_df(SYMBOL, interval="1m"))
+    df15 = apply_indicators(get_stock_df(SYMBOL, interval="15m"))
+
+    features = build_features(df1, df15)
+    prob = MODEL.predict_proba(features)[0][1]  # win probability
+
+    conf = confluences(df1)
+
+    if prob >= 0.65 and len(conf) >= 3:
+        return prob, conf, df1
+
+    return None, [], df1
+
+# ---------------- EXIT CHECK ---------------- #
+
+def check_exit(df):
+    price = df["Close"].iloc[-1]
+    if price < df["vwap"].iloc[-1]:
+        return True, "Lost VWAP"
+    if df["adx"].iloc[-1] < 15:
+        return True, "Trend Weakening"
+    return False, ""
+
+# ---------------- RISK / REWARD ---------------- #
+
+def risk_reward(entry, atr):
+    stop = round(entry - atr, 2)
+    target = round(entry + atr * 2, 2)
+    rr = round((target - entry) / (entry - stop), 2)
+    return stop, target, rr
+
+# ---------------- MAIN LOOP ---------------- #
+
+@tasks.loop(minutes=1)
+async def spy_loop():
+    global ACTIVE_TRADE
+
+    if not market_is_open():
+        return
+
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel:
+        return
+
+    prob, conf, df = check_entry()
     price = round(df["Close"].iloc[-1], 2)
+    atr = round(df["atr"].iloc[-1], 2)
 
-    option = filter_options(
-        calls if direction == "CALL" else puts,
-        direction,
-        price
-    )
+    # ENTRY
+    if ACTIVE_TRADE is None and prob:
+        stop, target, rr = risk_reward(price, atr)
 
-    if option is None:
-        return None
+        ACTIVE_TRADE = "CALL"
 
-    confidence = confidence_score(df, direction)
-    if confidence < 70:
-        return None
+        embed = discord.Embed(
+            title="📊 SPY ENTRY",
+            color=discord.Color.green(),
+            timestamp=datetime.now(pytz.utc)
+        )
 
-    atr = AverageTrueRange(df["High"], df["Low"], df["Close"]).average_true_range().iloc[-1]
+        embed.add_field(name="Entry", value=f"${price}")
+        embed.add_field(name="Stop", value=f"${stop}")
+        embed.add_field(name="Target", value=f"${target}")
+        embed.add_field(name="R:R", value=str(rr))
+        embed.add_field(name="Win Probability", value=f"{round(prob*100,1)}%")
 
-    vwap_indicator = VolumeWeightedAveragePrice(
-        high=df["High"], low=df["Low"], close=df["Close"], volume=df["Volume"]
-    )
-    vwap = round(vwap_indicator.vwap.iloc[-1], 2)
+        embed.add_field(name="Confluences", value="\n".join(conf), inline=False)
 
-    support, resistance = calculate_support_resistance(df)
-    fvg = detect_fvg(df)
-    trend = trend_strength(df)
+        embed.set_footer(text="ML Confirmed Trade")
 
-    # Trade levels
-    if direction == "CALL":
-        entry = price
-        target = round(price + atr * 1.5, 2)
-        stop = round(price - atr, 2)
-        emoji = "🟢📈"
-        option_label = f"${symbol} ${int(option['strike'])}C"
-    else:
-        entry = price
-        target = round(price - atr * 1.5, 2)
-        stop = round(price + atr, 2)
-        emoji = "🔴📉"
-        option_label = f"${symbol} ${int(option['strike'])}P"
+        await channel.send(embed=embed)
 
-    # Build confluence list
-    confluences = []
-
-    if price > vwap and direction == "CALL":
-        confluences.append("Above VWAP")
-    if price < vwap and direction == "PUT":
-        confluences.append("Below VWAP")
-
-    if fvg:
-        confluences.append(fvg)
-
-    confluences.append(f"Trend: {trend}")
-
-    if direction == "CALL":
-        confluences.append(f"Demand zone near ${support}")
-    else:
-        confluences.append(f"Supply zone near ${resistance}")
-
-    confluence_text = "\n".join([f"• {c}" for c in confluences[:4]])
-
-    embed = discord.Embed(
-        title=f"{emoji} {option_label}",
-        color=discord.Color.green() if direction == "CALL" else discord.Color.red()
-    )
-
-    embed.add_field(name="Entry", value=f"${entry}", inline=True)
-    embed.add_field(name="Target", value=f"${target}", inline=True)
-    embed.add_field(name="Stop", value=f"${stop}", inline=True)
-    embed.add_field(name="Confidence", value=f"{confidence}%", inline=True)
-
-    embed.add_field(name="Confluence", value=confluence_text, inline=False)
-
-    embed.add_field(
-        name="AI Confirmation",
-        value=f"High probability {direction} setup based on multi-indicator confluence.",
-        inline=False
-    )
-
-    embed.set_footer(text="⚠️ Educational use only")
-    embed.timestamp = datetime.now(timezone.utc)
-
-    return embed
-
-# ---------------- EVENTS ---------------- #
-
-@bot.event
-async def on_ready():
-    print("🔥 BOT ONLINE 🔥")
-    fast_alerts.start()
-    slow_alerts.start()
+    # EXIT
+    elif ACTIVE_TRADE:
+        exit_trade, reason = check_exit(df)
+        if exit_trade:
+            embed = discord.Embed(
+                title="🚪 SPY EXIT",
+                description=reason,
+                color=discord.Color.orange(),
+                timestamp=datetime.now(pytz.utc)
+            )
+            await channel.send(embed=embed)
+            ACTIVE_TRADE = None
 
 # ---------------- COMMAND ---------------- #
 
 @bot.command()
-async def play(ctx, symbol: str):
-    if not market_is_open():
-        await ctx.send("⏰ Market is closed (9:30am–4:00pm ET).")
-        return
+async def status(ctx):
+    await ctx.send("🤖 ML SPY Bot is running")
 
-    embed = await generate_trade_embed(symbol.upper())
-    if embed:
-        await ctx.send(embed=embed)
-    else:
-        await ctx.send(f"⚠️ No high-quality setup for {symbol.upper()}")
+# ---------------- READY ---------------- #
 
-# ---------------- AUTO TASKS ---------------- #
-
-@tasks.loop(minutes=15)
-async def fast_alerts():
-    if not market_is_open():
-        return
-
-    channel = bot.get_channel(CHANNEL_ID)
-    if not channel:
-        return
-
-    for symbol in FAST_WATCHLIST:
-        embed = await generate_trade_embed(symbol)
-        if embed:
-            await channel.send(embed=embed)
-
-@tasks.loop(minutes=30)
-async def slow_alerts():
-    if not market_is_open():
-        return
-
-    channel = bot.get_channel(CHANNEL_ID)
-    if not channel:
-        return
-
-    for symbol in SLOW_WATCHLIST:
-        embed = await generate_trade_embed(symbol)
-        if embed:
-            await channel.send(embed=embed)
+@bot.event
+async def on_ready():
+    print("🔥 ML SPY BOT ONLINE")
+    spy_loop.start()
 
 bot.run(TOKEN)

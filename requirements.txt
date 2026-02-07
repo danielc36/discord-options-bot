@@ -7,3 +7,5 @@ ta
 matplotlib
 pytz
 scipy
+scikit-learn
+joblib
