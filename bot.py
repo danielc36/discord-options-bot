@@ -2,238 +2,217 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import os
-from datetime import datetime, time, timezone
-import discord
-from discord.ext import commands, tasks
-import os
-from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timezone
 import pytz
 import pandas as pd
 import numpy as np
-from scipy.stats import linregress
 import joblib
-
-from market import get_stock_df
 
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.trend import ADXIndicator, IchimokuIndicator
 from ta.momentum import StochasticOscillator
 from ta.volume import VolumeWeightedAveragePrice
 
-# ---------------- LOAD ENV ---------------- #
+from market import get_stock_df  # must support interval="1m" and "15m"
+
+# ---------------- CONFIG ---------------- #
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-
 SYMBOL = "SPY"
-ACTIVE_TRADE = None
-MODEL = joblib.load("model.pkl")  # ML model
+TRADE_ACTIVE = False
+LAST_DIRECTION = None
 
-eastern = pytz.timezone("US/Eastern")
+# Load ML model
+try:
+    model = joblib.load("model.pkl")
+    print("✅ ML model loaded")
+except:
+    model = None
+    print("⚠️ model.pkl not found — running without ML filter")
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------- MARKET HOURS ---------------- #
 
 def market_is_open():
+    eastern = pytz.timezone("US/Eastern")
     now = datetime.now(eastern)
     if now.weekday() >= 5:
         return False
-    return (now.hour > 9 or (now.hour == 9 and now.minute >= 30)) and now.hour < 16
+    return datetime.strptime("09:30", "%H:%M").time() <= now.time() <= datetime.strptime("16:00", "%H:%M").time()
 
 # ---------------- INDICATORS ---------------- #
 
-def apply_indicators(df):
+def add_indicators(df):
     bb = BollingerBands(df["Close"])
-    df["bb_high"] = bb.bollinger_hband()
-    df["bb_low"] = bb.bollinger_lband()
-
-    stoch = StochasticOscillator(df["High"], df["Low"], df["Close"])
-    df["stoch"] = stoch.stoch()
+    df["bb_width"] = bb.bollinger_hband() - bb.bollinger_lband()
 
     adx = ADXIndicator(df["High"], df["Low"], df["Close"])
     df["adx"] = adx.adx()
 
-    ichi = IchimokuIndicator(df["High"], df["Low"])
-    df["ichimoku"] = ichi.ichimoku_base_line()
+    stoch = StochasticOscillator(df["High"], df["Low"], df["Close"])
+    df["stoch"] = stoch.stoch()
+
+    atr = AverageTrueRange(df["High"], df["Low"], df["Close"])
+    df["atr"] = atr.average_true_range()
 
     vwap = VolumeWeightedAveragePrice(df["High"], df["Low"], df["Close"], df["Volume"])
     df["vwap"] = vwap.vwap
 
-    df["atr"] = AverageTrueRange(df["High"], df["Low"], df["Close"]).average_true_range()
+    df["std"] = df["Close"].rolling(20).std()
+
+    ichi = IchimokuIndicator(df["High"], df["Low"])
+    df["tenkan"] = ichi.ichimoku_conversion_line()
+    df["kijun"] = ichi.ichimoku_base_line()
 
     df.dropna(inplace=True)
     return df
 
-# ---------------- PATTERN DETECTION ---------------- #
+# ---------------- TREND LOGIC ---------------- #
 
-def detect_fvg(df):
-    if len(df) < 3:
-        return 0
-    if df["Low"].iloc[-1] > df["High"].iloc[-3]:
-        return 1
-    if df["High"].iloc[-1] < df["Low"].iloc[-3]:
-        return -1
-    return 0
+def determine_direction(df1m, df15m):
+    price = df1m["Close"].iloc[-1]
+    vwap = df1m["vwap"].iloc[-1]
+    adx = df15m["adx"].iloc[-1]
 
-def detect_wedge(df):
-    closes = df["Close"].tail(20).values
-    x = np.arange(len(closes))
-    slope, _, _, _, _ = linregress(x, closes)
-    return slope
+    if price > vwap and adx > 20:
+        return "CALL"
+    elif price < vwap and adx > 20:
+        return "PUT"
+    else:
+        return "NO TRADE"
 
-def detect_trendline_break(df):
-    closes = df["Close"].tail(20).values
-    x = np.arange(len(closes))
-    slope, intercept, _, _, _ = linregress(x, closes)
-    trendline = slope * x + intercept
-    return 1 if closes[-1] < trendline[-1] else 0
+# ---------------- ML FEATURES ---------------- #
 
-# ---------------- FEATURE ENGINEERING ---------------- #
-
-def build_features(df1, df15):
-    price = df1["Close"].iloc[-1]
-
-    features = [
-        price - df1["vwap"].iloc[-1],
-        df1["stoch"].iloc[-1],
-        df1["adx"].iloc[-1],
-        price - df1["ichimoku"].iloc[-1],
-        price - df1["bb_low"].iloc[-1],
-        detect_fvg(df1),
-        detect_wedge(df1),
-        detect_trendline_break(df1),
-        df15["adx"].iloc[-1],
-        df15["Close"].iloc[-1] - df15["vwap"].iloc[-1],
-        df1["atr"].iloc[-1],
-        df1["Volume"].iloc[-1]
+def build_features(df1m, df15m):
+    return [
+        df1m["stoch"].iloc[-1],
+        df1m["bb_width"].iloc[-1],
+        df1m["atr"].iloc[-1],
+        df1m["std"].iloc[-1],
+        df1m["vwap"].iloc[-1],
+        df15m["adx"].iloc[-1],
+        df15m["stoch"].iloc[-1],
+        df15m["bb_width"].iloc[-1],
+        df15m["std"].iloc[-1]
     ]
 
-    return np.array(features).reshape(1, -1)
+# ---------------- CONFLUENCES ---------------- #
 
-# ---------------- CONFLUENCE TEXT ---------------- #
+def confluences(df1m, df15m):
+    conflu = []
 
-def confluences(df):
-    conf = []
-    price = df["Close"].iloc[-1]
+    if df1m["Close"].iloc[-1] > df1m["vwap"].iloc[-1]:
+        conflu.append("Above VWAP")
 
-    if price > df["vwap"].iloc[-1]:
-        conf.append("Above VWAP")
-    if df["stoch"].iloc[-1] < 20:
-        conf.append("Stoch Oversold")
-    if df["adx"].iloc[-1] > 20:
-        conf.append("Strong Trend (ADX)")
-    if price > df["ichimoku"].iloc[-1]:
-        conf.append("Above Ichimoku")
-    if detect_fvg(df) == 1:
-        conf.append("Bullish FVG")
-    if detect_trendline_break(df):
-        conf.append("Trendline Break")
+    if df15m["adx"].iloc[-1] > 25:
+        conflu.append("Strong Trend (ADX)")
 
-    return conf
+    if df1m["stoch"].iloc[-1] < 20:
+        conflu.append("Oversold")
 
-# ---------------- ENTRY CHECK ---------------- #
+    if df1m["stoch"].iloc[-1] > 80:
+        conflu.append("Overbought")
 
-def check_entry():
-    df1 = apply_indicators(get_stock_df(SYMBOL, interval="1m"))
-    df15 = apply_indicators(get_stock_df(SYMBOL, interval="15m"))
+    return conflu
 
-    features = build_features(df1, df15)
-    prob = MODEL.predict_proba(features)[0][1]  # win probability
+# ---------------- EMBED ---------------- #
 
-    conf = confluences(df1)
+def build_embed(direction, df1m, df15m):
+    price = round(df1m["Close"].iloc[-1], 2)
+    atr = df1m["atr"].iloc[-1]
+    time_now = datetime.now(timezone.utc)
 
-    if prob >= 0.65 and len(conf) >= 3:
-        return prob, conf, df1
+    if direction == "CALL":
+        target = round(price + atr * 1.5, 2)
+        stop = round(price - atr, 2)
+        emoji = "🟢📈"
+        color = discord.Color.green()
+    else:
+        target = round(price - atr * 1.5, 2)
+        stop = round(price + atr, 2)
+        emoji = "🔴📉"
+        color = discord.Color.red()
 
-    return None, [], df1
+    conf = confluences(df1m, df15m)
 
-# ---------------- EXIT CHECK ---------------- #
+    embed = discord.Embed(
+        title=f"{emoji} SPY {direction}",
+        color=color,
+        timestamp=time_now
+    )
 
-def check_exit(df):
-    price = df["Close"].iloc[-1]
-    if price < df["vwap"].iloc[-1]:
-        return True, "Lost VWAP"
-    if df["adx"].iloc[-1] < 15:
-        return True, "Trend Weakening"
-    return False, ""
+    embed.add_field(name="Price", value=f"${price}", inline=True)
+    embed.add_field(name="Target", value=f"🟢 ${target}", inline=True)
+    embed.add_field(name="Stop", value=f"🔴 ${stop}", inline=True)
 
-# ---------------- RISK / REWARD ---------------- #
+    embed.add_field(
+        name="Confluences",
+        value="• " + "\n• ".join(conf),
+        inline=False
+    )
 
-def risk_reward(entry, atr):
-    stop = round(entry - atr, 2)
-    target = round(entry + atr * 2, 2)
-    rr = round((target - entry) / (entry - stop), 2)
-    return stop, target, rr
+    embed.set_footer(text="Educational use only")
+    return embed
 
-# ---------------- MAIN LOOP ---------------- #
+# ---------------- CORE LOGIC ---------------- #
 
-@tasks.loop(minutes=1)
-async def spy_loop():
-    global ACTIVE_TRADE
+async def check_trade():
+    global TRADE_ACTIVE, LAST_DIRECTION
 
-    if not market_is_open():
-        return
+    df1m = get_stock_df(SYMBOL, interval="1m")
+    df15m = get_stock_df(SYMBOL, interval="15m")
+
+    df1m = add_indicators(df1m)
+    df15m = add_indicators(df15m)
+
+    direction = determine_direction(df1m, df15m)
+
+    # ML FILTER
+    if model:
+        features = build_features(df1m, df15m)
+        prob = model.predict_proba([features])[0][1]
+        if prob < 0.65:
+            direction = "NO TRADE"
 
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         return
 
-    prob, conf, df = check_entry()
-    price = round(df["Close"].iloc[-1], 2)
-    atr = round(df["atr"].iloc[-1], 2)
-
     # ENTRY
-    if ACTIVE_TRADE is None and prob:
-        stop, target, rr = risk_reward(price, atr)
-
-        ACTIVE_TRADE = "CALL"
-
-        embed = discord.Embed(
-            title="📊 SPY ENTRY",
-            color=discord.Color.green(),
-            timestamp=datetime.now(pytz.utc)
-        )
-
-        embed.add_field(name="Entry", value=f"${price}")
-        embed.add_field(name="Stop", value=f"${stop}")
-        embed.add_field(name="Target", value=f"${target}")
-        embed.add_field(name="R:R", value=str(rr))
-        embed.add_field(name="Win Probability", value=f"{round(prob*100,1)}%")
-
-        embed.add_field(name="Confluences", value="\n".join(conf), inline=False)
-
-        embed.set_footer(text="ML Confirmed Trade")
-
+    if not TRADE_ACTIVE and direction in ["CALL", "PUT"]:
+        embed = build_embed(direction, df1m, df15m)
         await channel.send(embed=embed)
+        TRADE_ACTIVE = True
+        LAST_DIRECTION = direction
 
     # EXIT
-    elif ACTIVE_TRADE:
-        exit_trade, reason = check_exit(df)
-        if exit_trade:
-            embed = discord.Embed(
-                title="🚪 SPY EXIT",
-                description=reason,
-                color=discord.Color.orange(),
-                timestamp=datetime.now(pytz.utc)
-            )
-            await channel.send(embed=embed)
-            ACTIVE_TRADE = None
+    elif TRADE_ACTIVE:
+        if direction == "NO TRADE":
+            await channel.send("⚠️ Trade exit signal — conditions no longer valid.")
+            TRADE_ACTIVE = False
+            LAST_DIRECTION = None
 
-# ---------------- COMMAND ---------------- #
+# ---------------- TASK LOOP ---------------- #
 
-@bot.command()
-async def status(ctx):
-    await ctx.send("🤖 ML SPY Bot is running")
+@tasks.loop(minutes=1)
+async def spy_loop():
+    if market_is_open():
+        try:
+            await check_trade()
+        except Exception as e:
+            print("Loop error:", e)
 
-# ---------------- READY ---------------- #
+# ---------------- EVENTS ---------------- #
 
 @bot.event
 async def on_ready():
-    print("🔥 ML SPY BOT ONLINE")
+    print("🚀 SPY ML BOT ONLINE")
     spy_loop.start()
 
 bot.run(TOKEN)
