@@ -230,26 +230,56 @@ async def check_trade():
 
     direction = determine_direction(df1m, df15m)
 
+    exit_reasons = []
+
+    # ---------- ML FILTER ----------
     if model:
         features = build_features(df1m, df15m)
         prob = model.predict_proba([features])[0][1]
         if prob < 0.65:
             direction = "NO TRADE"
+            exit_reasons.append("ML confidence dropped")
 
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         return
 
+    price = round(df1m["Close"].iloc[-1], 2)
+
+    # ---------- ENTRY ----------
     if not TRADE_ACTIVE and direction in ["CALL", "PUT"]:
         embed = build_embed(direction, df1m, df15m)
-        await channel.send(embed=embed)
+        await channel.send(content="🟢 **BUY SIGNAL**", embed=embed)
+
         TRADE_ACTIVE = True
         LAST_DIRECTION = direction
+        return
 
-    elif TRADE_ACTIVE and direction == "NO TRADE":
-        await channel.send("⚠️ Trade exit signal — pattern or trend invalidated.")
+    # ---------- HOLD ----------
+    if TRADE_ACTIVE and direction == LAST_DIRECTION:
+        # Do nothing (still valid trade)
+        return
+
+    # ---------- EXIT ----------
+    if TRADE_ACTIVE and (direction == "NO TRADE" or direction != LAST_DIRECTION):
+
+        # Build exit reason
+        if direction == "NO TRADE":
+            exit_reasons.append("Indicators lost confluence")
+        else:
+            exit_reasons.append("Trend reversal detected")
+
+        exit_text = (
+            f"🔴 **SELL SIGNAL – {LAST_DIRECTION}**\n"
+            f"Price: ${price}\n"
+            f"Reason:\n• " + "\n• ".join(exit_reasons)
+        )
+
+        await channel.send(exit_text)
+
         TRADE_ACTIVE = False
         LAST_DIRECTION = None
+
 
 # ---------------- TASK LOOP ---------------- #
 
