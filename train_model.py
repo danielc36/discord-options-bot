@@ -6,110 +6,71 @@ import joblib
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.trend import ADXIndicator
 from ta.momentum import StochasticOscillator
-from ta.volume import VolumeWeightedAveragePrice
-
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
 
 print("📥 Downloading historical SPY data...")
 
-df1m = yf.download("SPY", period="5d", interval="1m")
-df15m = yf.download("SPY", period="60d", interval="15m")
-
-# Fix multi-index columns
-df1m.columns = df1m.columns.get_level_values(0)
-df15m.columns = df15m.columns.get_level_values(0)
+df1m = yf.download("SPY", period="7d", interval="1m", auto_adjust=True)
+df15m = yf.download("SPY", period="30d", interval="15m", auto_adjust=True)
 
 df1m.dropna(inplace=True)
 df15m.dropna(inplace=True)
 
-# -------- 1 MIN INDICATORS -------- #
+# Force 1D series (fix for your error)
+close1m = df1m["Close"].squeeze()
+high1m = df1m["High"].squeeze()
+low1m = df1m["Low"].squeeze()
 
-bb1 = BollingerBands(close=df1m["Close"])
-df1m["bb_width_1m"] = bb1.bollinger_hband() - bb1.bollinger_lband()
+close15m = df15m["Close"].squeeze()
+high15m = df15m["High"].squeeze()
+low15m = df15m["Low"].squeeze()
 
-atr1 = AverageTrueRange(df1m["High"], df1m["Low"], df1m["Close"])
-df1m["atr_1m"] = atr1.average_true_range()
+# ---------------- INDICATORS ---------------- #
 
-stoch1 = StochasticOscillator(df1m["High"], df1m["Low"], df1m["Close"])
-df1m["stoch_1m"] = stoch1.stoch()
+bb = BollingerBands(close1m)
+df1m["bb_width"] = bb.bollinger_hband() - bb.bollinger_lband()
 
-vwap1 = VolumeWeightedAveragePrice(
-    high=df1m["High"],
-    low=df1m["Low"],
-    close=df1m["Close"],
-    volume=df1m["Volume"]
-)
-df1m["vwap_1m"] = vwap1.vwap   # FIXED
+stoch = StochasticOscillator(high1m, low1m, close1m)
+df1m["stoch"] = stoch.stoch()
 
-df1m["std_1m"] = df1m["Close"].rolling(20).std()
+atr = AverageTrueRange(high1m, low1m, close1m)
+df1m["atr"] = atr.average_true_range()
 
-# -------- 15 MIN INDICATORS -------- #
+df1m["std"] = close1m.rolling(20).std()
 
-bb15 = BollingerBands(close=df15m["Close"])
-df15m["bb_width_15m"] = bb15.bollinger_hband() - bb15.bollinger_lband()
+adx = ADXIndicator(high15m, low15m, close15m)
+df15m["adx"] = adx.adx()
 
-stoch15 = StochasticOscillator(df15m["High"], df15m["Low"], df15m["Close"])
-df15m["stoch_15m"] = stoch15.stoch()
+df1m.dropna(inplace=True)
+df15m.dropna(inplace=True)
 
-adx15 = ADXIndicator(df15m["High"], df15m["Low"], df15m["Close"])
-df15m["adx_15m"] = adx15.adx()
+# Align sizes
+min_len = min(len(df1m), len(df15m))
+df1m = df1m.iloc[-min_len:]
+df15m = df15m.iloc[-min_len:]
 
-df15m["std_15m"] = df15m["Close"].rolling(20).std()
+# ---------------- FEATURES ---------------- #
 
-# -------- ALIGN TIMEFRAMES -------- #
+X = pd.DataFrame({
+    "stoch": df1m["stoch"],
+    "bb_width": df1m["bb_width"],
+    "atr": df1m["atr"],
+    "adx": df15m["adx"],
+    "std": df1m["std"]
+})
 
-df1m = df1m.reset_index()
-df15m = df15m.reset_index()
+# Label: next candle direction
+y = (close1m.shift(-1).iloc[-min_len:] > close1m.iloc[-min_len:]).astype(int)
 
-df1m["time"] = pd.to_datetime(df1m["Datetime"]).dt.floor("15min")
-df15m["time"] = pd.to_datetime(df15m["Datetime"])
+X.dropna(inplace=True)
+y = y.loc[X.index]
 
-merged = pd.merge(df1m, df15m, on="time", suffixes=("_1m", "_15m"))
+# ---------------- TRAIN MODEL ---------------- #
 
-# -------- LABELS -------- #
-
-merged["future_close"] = merged["Close_1m"].shift(-5)
-merged["target"] = np.where(merged["future_close"] > merged["Close_1m"], 1, 0)
-
-# -------- FEATURES -------- #
-
-feature_cols = [
-    "stoch_1m",
-    "bb_width_1m",
-    "atr_1m",
-    "std_1m",
-    "vwap_1m",
-    "adx_15m",
-    "stoch_15m",
-    "bb_width_15m",
-    "std_15m"
-]
-
-merged.dropna(inplace=True)
-
-X = merged[feature_cols]
-y = merged["target"]
-
-# -------- TRAIN -------- #
-
-print("🧠 Training ML model...")
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, shuffle=False
-)
-
-model = RandomForestClassifier(
-    n_estimators=200,
-    max_depth=10,
-    random_state=42
-)
-
-model.fit(X_train, y_train)
-
-preds = model.predict(X_test)
-print(classification_report(y_test, preds))
+model = RandomForestClassifier(n_estimators=200, random_state=42)
+model.fit(X, y)
 
 joblib.dump(model, "model.pkl")
-print("✅ model.pkl saved successfully")
+
+print("✅ Model trained and saved as model.pkl")
+print("Features used:", list(X.columns))
