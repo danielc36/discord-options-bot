@@ -54,30 +54,51 @@ def market_is_open():
 
 # ---------------- INDICATORS ---------------- #
 
-def add_indicators(df):
-    bb = BollingerBands(df["Close"])
-    df["bb_width"] = bb.bollinger_hband() - bb.bollinger_lband()
+from ta.volatility import BollingerBands, AverageTrueRange
+from ta.trend import ADXIndicator
+from ta.momentum import StochasticOscillator
+from ta.volume import VolumeWeightedAveragePrice
 
-    adx = ADXIndicator(df["High"], df["Low"], df["Close"])
-    df["adx"] = adx.adx()
 
-    stoch = StochasticOscillator(df["High"], df["Low"], df["Close"])
-    df["stoch"] = stoch.stoch()
+def add_indicators_1m(df):
+    bb = BollingerBands(close=df["Close"])
+    df["bb_width_1m"] = bb.bollinger_hband() - bb.bollinger_lband()
 
     atr = AverageTrueRange(df["High"], df["Low"], df["Close"])
-    df["atr"] = atr.average_true_range()
+    df["atr_1m"] = atr.average_true_range()
 
-    vwap = VolumeWeightedAveragePrice(df["High"], df["Low"], df["Close"], df["Volume"])
-    df["vwap"] = vwap.vwap
+    stoch = StochasticOscillator(df["High"], df["Low"], df["Close"])
+    df["stoch_1m"] = stoch.stoch()
 
-    df["std"] = df["Close"].rolling(20).std()
+    vwap = VolumeWeightedAveragePrice(
+        high=df["High"],
+        low=df["Low"],
+        close=df["Close"],
+        volume=df["Volume"]
+    )
+    df["vwap_1m"] = vwap.vwap
 
-    ichi = IchimokuIndicator(df["High"], df["Low"])
-    df["tenkan"] = ichi.ichimoku_conversion_line()
-    df["kijun"] = ichi.ichimoku_base_line()
+    df["std_1m"] = df["Close"].rolling(20).std()
 
     df.dropna(inplace=True)
     return df
+
+
+def add_indicators_15m(df):
+    bb = BollingerBands(close=df["Close"])
+    df["bb_width_15m"] = bb.bollinger_hband() - bb.bollinger_lband()
+
+    stoch = StochasticOscillator(df["High"], df["Low"], df["Close"])
+    df["stoch_15m"] = stoch.stoch()
+
+    adx = ADXIndicator(df["High"], df["Low"], df["Close"])
+    df["adx_15m"] = adx.adx()
+
+    df["std_15m"] = df["Close"].rolling(20).std()
+
+    df.dropna(inplace=True)
+    return df
+
 
 # ---------------- PATTERN DETECTION ---------------- #
 
@@ -146,17 +167,18 @@ def determine_direction(df1m, df15m):
 # ---------------- ML FEATURES ---------------- #
 
 def build_features(df1m, df15m):
-    return [
-        df1m["stoch"].iloc[-1],
-        df1m["bb_width"].iloc[-1],
-        df1m["atr"].iloc[-1],
-        df1m["std"].iloc[-1],
-        df1m["vwap"].iloc[-1],
-        df15m["adx"].iloc[-1],
-        df15m["stoch"].iloc[-1],
-        df15m["bb_width"].iloc[-1],
-        df15m["std"].iloc[-1]
-    ]
+    return [[
+        df1m["stoch_1m"].iloc[-1],
+        df1m["bb_width_1m"].iloc[-1],
+        df1m["atr_1m"].iloc[-1],
+        df1m["std_1m"].iloc[-1],
+        df1m["vwap_1m"].iloc[-1],
+        df15m["adx_15m"].iloc[-1],
+        df15m["stoch_15m"].iloc[-1],
+        df15m["bb_width_15m"].iloc[-1],
+        df15m["std_15m"].iloc[-1]
+    ]]
+
 
 # ---------------- CONFLUENCES ---------------- #
 
@@ -230,8 +252,11 @@ async def check_trade():
     df1m = get_stock_df(SYMBOL, interval="1m")
     df15m = get_stock_df(SYMBOL, interval="15m")
 
-    df1m = add_indicators(df1m)
-    df15m = add_indicators(df15m)
+    df1m = add_indicators_1m(df1m)
+    df15m = add_indicators_15m(df15m)
+
+    features = build_features(df1m, df15m)
+    prob = model.predict_proba(features)[0][1]
 
     direction = determine_direction(df1m, df15m)
 
