@@ -4,9 +4,9 @@ from dotenv import load_dotenv
 import os
 from datetime import datetime, timezone
 import pytz
+import joblib
 import pandas as pd
 import numpy as np
-import joblib
 
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.trend import ADXIndicator, IchimokuIndicator
@@ -42,8 +42,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 def market_is_open():
     eastern = pytz.timezone("US/Eastern")
     now = datetime.now(eastern)
+
     if now.weekday() >= 5:
         return False
+
     return datetime.strptime("09:30", "%H:%M").time() <= now.time() <= datetime.strptime("16:00", "%H:%M").time()
 
 # ---------------- INDICATORS ---------------- #
@@ -105,21 +107,23 @@ def build_features(df1m, df15m):
 # ---------------- CONFLUENCES ---------------- #
 
 def confluences(df1m, df15m):
-    conflu = []
+    conf = []
 
     if df1m["Close"].iloc[-1] > df1m["vwap"].iloc[-1]:
-        conflu.append("Above VWAP")
+        conf.append("Above VWAP")
+    else:
+        conf.append("Below VWAP")
 
     if df15m["adx"].iloc[-1] > 25:
-        conflu.append("Strong Trend (ADX)")
+        conf.append("Strong Trend (ADX)")
 
     if df1m["stoch"].iloc[-1] < 20:
-        conflu.append("Oversold")
+        conf.append("Oversold (Stoch)")
 
     if df1m["stoch"].iloc[-1] > 80:
-        conflu.append("Overbought")
+        conf.append("Overbought (Stoch)")
 
-    return conflu
+    return conf
 
 # ---------------- EMBED ---------------- #
 
@@ -148,8 +152,8 @@ def build_embed(direction, df1m, df15m):
     )
 
     embed.add_field(name="Price", value=f"${price}", inline=True)
-    embed.add_field(name="Target", value=f"🟢 ${target}", inline=True)
-    embed.add_field(name="Stop", value=f"🔴 ${stop}", inline=True)
+    embed.add_field(name="Target", value=f"${target}", inline=True)
+    embed.add_field(name="Stop", value=f"${stop}", inline=True)
 
     embed.add_field(
         name="Confluences",
