@@ -154,13 +154,13 @@ def detect_patterns(df):
 
 def determine_direction(df1m, df15m):
     price = df1m["Close"].iloc[-1]
-    vwap = df1m["vwap"].iloc[-1]
-    adx = df15m["adx"].iloc[-1]
+    vwap = df1m["vwap_1m"].iloc[-1]
+    adx = df15m["adx_15m"].iloc[-1]
 
     if price > vwap and adx > 20:
-        return "CALL"
+        return "BUY"
     elif price < vwap and adx > 20:
-        return "PUT"
+        return "SELL"
     else:
         return "NO TRADE"
 
@@ -183,27 +183,21 @@ def build_features(df1m, df15m):
 # ---------------- CONFLUENCES ---------------- #
 
 def confluences(df1m, df15m):
-    conf = []
+    conflu = []
 
-    if df1m["Close"].iloc[-1] > df1m["vwap"].iloc[-1]:
-        conf.append("Above VWAP")
-    else:
-        conf.append("Below VWAP")
+    if df1m["Close"].iloc[-1] > df1m["vwap_1m"].iloc[-1]:
+        conflu.append("Above VWAP (1m)")
 
-    if df15m["adx"].iloc[-1] > 25:
-        conf.append("Strong Trend (ADX)")
+    if df15m["adx_15m"].iloc[-1] > 25:
+        conflu.append("Strong Trend (15m ADX)")
 
-    if df1m["stoch"].iloc[-1] < 20:
-        conf.append("Oversold (Stoch)")
+    if df1m["stoch_1m"].iloc[-1] < 20:
+        conflu.append("Oversold (1m Stoch)")
 
-    if df1m["stoch"].iloc[-1] > 80:
-        conf.append("Overbought (Stoch)")
+    if df1m["stoch_1m"].iloc[-1] > 80:
+        conflu.append("Overbought (1m Stoch)")
 
-    patterns = detect_patterns(df1m)
-    for p in patterns:
-        conf.append(f"Pattern: {p}")
-
-    return conf
+    return conflu
 
 # ---------------- EMBED ---------------- #
 
