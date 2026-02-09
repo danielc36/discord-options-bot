@@ -26,12 +26,17 @@ TRADE_ACTIVE = False
 LAST_DIRECTION = None
 
 # Load ML model
+import os
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "model.pkl")
+
 try:
-    model = joblib.load("model.pkl")
+    model = joblib.load(MODEL_PATH)
     print("✅ ML model loaded")
-except:
+except Exception as e:
     model = None
     print("⚠️ model.pkl not found — running without ML filter")
+    print("Error:", e)
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
