@@ -13,7 +13,7 @@ from ta.trend import ADXIndicator, IchimokuIndicator
 from ta.momentum import StochasticOscillator
 from ta.volume import VolumeWeightedAveragePrice
 
-from market import get_stock_df  # must support interval="1m" and "15m"
+from market import get_stock_df
 
 # ---------------- CONFIG ---------------- #
 
@@ -34,7 +34,6 @@ except:
     print("⚠️ model.pkl not found — running without ML filter")
 
 intents = discord.Intents.default()
-intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------- MARKET HOURS ---------------- #
@@ -74,6 +73,56 @@ def add_indicators(df):
 
     df.dropna(inplace=True)
     return df
+
+# ---------------- PATTERN DETECTION ---------------- #
+
+def detect_patterns(df):
+    patterns = []
+    prices = df["Close"].values[-50:]
+
+    if len(prices) < 20:
+        return patterns
+
+    # Peaks & troughs
+    highs = prices[np.r_[True, prices[1:] > prices[:-1]] & np.r_[prices[:-1] > prices[1:], True]]
+    lows = prices[np.r_[True, prices[1:] < prices[:-1]] & np.r_[prices[:-1] < prices[1:], True]]
+
+    # Double Top
+    if len(highs) >= 2 and abs(highs[-1] - highs[-2]) / highs[-1] < 0.002:
+        patterns.append("Double Top")
+
+    # Double Bottom
+    if len(lows) >= 2 and abs(lows[-1] - lows[-2]) / lows[-1] < 0.002:
+        patterns.append("Double Bottom")
+
+    # Head and Shoulders
+    if len(highs) >= 3:
+        if highs[-2] > highs[-1] and highs[-2] > highs[-3]:
+            patterns.append("Head & Shoulders")
+
+    # Rounding Bottom
+    if np.polyfit(range(len(prices)), prices, 2)[0] > 0:
+        patterns.append("Rounding Bottom")
+
+    # Cup and Handle (simplified)
+    if prices[-1] > prices.mean() and np.min(prices) == prices[len(prices)//2]:
+        patterns.append("Cup & Handle")
+
+    # Wedges / Triangles via trend slope
+    slope = np.polyfit(range(len(prices)), prices, 1)[0]
+
+    if abs(slope) < 0.001:
+        patterns.append("Symmetrical Triangle")
+    elif slope > 0.002:
+        patterns.append("Ascending Triangle")
+    elif slope < -0.002:
+        patterns.append("Descending Triangle")
+
+    # Flags / Pennants
+    if df["atr"].iloc[-1] < df["atr"].rolling(20).mean().iloc[-1]:
+        patterns.append("Flag / Pennant")
+
+    return patterns
 
 # ---------------- TREND LOGIC ---------------- #
 
@@ -123,6 +172,10 @@ def confluences(df1m, df15m):
     if df1m["stoch"].iloc[-1] > 80:
         conf.append("Overbought (Stoch)")
 
+    patterns = detect_patterns(df1m)
+    for p in patterns:
+        conf.append(f"Pattern: {p}")
+
     return conf
 
 # ---------------- EMBED ---------------- #
@@ -157,7 +210,7 @@ def build_embed(direction, df1m, df15m):
 
     embed.add_field(
         name="Confluences",
-        value="• " + "\n• ".join(conf),
+        value="• " + "\n• ".join(conf[:12]),
         inline=False
     )
 
@@ -177,7 +230,6 @@ async def check_trade():
 
     direction = determine_direction(df1m, df15m)
 
-    # ML FILTER
     if model:
         features = build_features(df1m, df15m)
         prob = model.predict_proba([features])[0][1]
@@ -188,19 +240,16 @@ async def check_trade():
     if not channel:
         return
 
-    # ENTRY
     if not TRADE_ACTIVE and direction in ["CALL", "PUT"]:
         embed = build_embed(direction, df1m, df15m)
         await channel.send(embed=embed)
         TRADE_ACTIVE = True
         LAST_DIRECTION = direction
 
-    # EXIT
-    elif TRADE_ACTIVE:
-        if direction == "NO TRADE":
-            await channel.send("⚠️ Trade exit signal — conditions no longer valid.")
-            TRADE_ACTIVE = False
-            LAST_DIRECTION = None
+    elif TRADE_ACTIVE and direction == "NO TRADE":
+        await channel.send("⚠️ Trade exit signal — pattern or trend invalidated.")
+        TRADE_ACTIVE = False
+        LAST_DIRECTION = None
 
 # ---------------- TASK LOOP ---------------- #
 
@@ -216,7 +265,7 @@ async def spy_loop():
 
 @bot.event
 async def on_ready():
-    print("🚀 SPY ML BOT ONLINE")
+    print("🚀 SPY PATTERN BOT ONLINE")
     spy_loop.start()
 
 bot.run(TOKEN)
