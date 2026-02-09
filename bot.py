@@ -66,17 +66,19 @@ def add_indicators(df):
 # ---------- FEATURES ---------- #
 
 def build_features(df1m, df15m):
-    return [[
-        df1m["stoch"].iloc[-1],
-        df1m["bb_width"].iloc[-1],
-        df1m["atr"].iloc[-1],
-        df1m["std"].iloc[-1],
-        df1m["vwap"].iloc[-1],
-        df15m["adx"].iloc[-1],
-        df15m["stoch"].iloc[-1],
-        df15m["bb_width"].iloc[-1],
-        df15m["std"].iloc[-1]
-    ]]
+    data = {
+        "stoch_1m": df1m["stoch"].iloc[-1],
+        "bb_width_1m": df1m["bb_width"].iloc[-1],
+        "atr_1m": df1m["atr"].iloc[-1],
+        "std_1m": df1m["std"].iloc[-1],
+        "vwap_1m": df1m["vwap"].iloc[-1],
+        "adx_15m": df15m["adx"].iloc[-1],
+        "stoch_15m": df15m["stoch"].iloc[-1],
+        "bb_width_15m": df15m["bb_width"].iloc[-1],
+        "std_15m": df15m["std"].iloc[-1]
+    }
+
+    return pd.DataFrame([data])
 
 # ---------- DIRECTION ---------- #
 
