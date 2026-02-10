@@ -14,28 +14,23 @@ from ta.volume import VolumeWeightedAveragePrice
 
 from market import get_stock_df
 
-# ---------- CONFIG ---------- #
+# ================= CONFIG ================= #
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
 SYMBOL = "SPY"
 TRADE_ACTIVE = False
 LAST_DIRECTION = None
 
-# Load ML model
-try:
-    model = joblib.load("model.pkl")
-    print("✅ ML model loaded")
-except:
-    model = None
-    print("⚠️ model.pkl not found — running without ML filter")
+model = joblib.load("model.pkl")
+print("✅ ML model loaded")
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---------- MARKET HOURS ---------- #
+# ================= MARKET HOURS ================= #
 
 def market_is_open():
     eastern = pytz.timezone("US/Eastern")
@@ -44,13 +39,16 @@ def market_is_open():
         return False
     return datetime.strptime("09:30", "%H:%M").time() <= now.time() <= datetime.strptime("16:00", "%H:%M").time()
 
-# ---------- INDICATORS ---------- #
+# ================= INDICATORS ================= #
 
 def add_indicators(df):
-    close = df["Close"].squeeze()
-    high = df["High"].squeeze()
-    low = df["Low"].squeeze()
-    vol = df["Volume"].squeeze()
+    if len(df) < 30:
+        return None
+
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+    vol = df["Volume"]
 
     bb = BollingerBands(close)
     df["bb_width"] = bb.bollinger_hband() - bb.bollinger_lband()
@@ -70,12 +68,16 @@ def add_indicators(df):
     df["vwap"] = vwap.vwap
 
     df.dropna(inplace=True)
+
+    if len(df) < 5:
+        return None
+
     return df
 
-# ---------- FEATURES ---------- #
+# ================= FEATURES ================= #
 
 def build_features(df1m, df15m):
-    data = {
+    return pd.DataFrame([{
         "stoch_1m": df1m["stoch"].iloc[-1],
         "bb_width_1m": df1m["bb_width"].iloc[-1],
         "atr_1m": df1m["atr"].iloc[-1],
@@ -85,11 +87,9 @@ def build_features(df1m, df15m):
         "stoch_15m": df15m["stoch"].iloc[-1],
         "bb_width_15m": df15m["bb_width"].iloc[-1],
         "std_15m": df15m["std"].iloc[-1]
-    }
+    }])
 
-    return pd.DataFrame([data])
-
-# ---------- DIRECTION ---------- #
+# ================= DIRECTION ================= #
 
 def determine_direction(df1m, df15m):
     price = df1m["Close"].iloc[-1]
@@ -102,18 +102,14 @@ def determine_direction(df1m, df15m):
         return "SELL"
     return "HOLD"
 
-# ---------- EMBEDS ---------- #
+# ================= EMBEDS ================= #
 
 def build_entry_embed(direction, price, prob, atr):
     color = discord.Color.green() if direction == "BUY" else discord.Color.red()
     emoji = "🟢📈" if direction == "BUY" else "🔴📉"
 
-    if direction == "BUY":
-        target = round(price + atr * 1.5, 2)
-        stop = round(price - atr, 2)
-    else:
-        target = round(price - atr * 1.5, 2)
-        stop = round(price + atr, 2)
+    target = round(price + atr * 1.5, 2) if direction == "BUY" else round(price - atr * 1.5, 2)
+    stop = round(price - atr, 2) if direction == "BUY" else round(price + atr, 2)
 
     embed = discord.Embed(
         title=f"{emoji} SPY {direction}",
@@ -121,10 +117,10 @@ def build_entry_embed(direction, price, prob, atr):
         timestamp=datetime.now(timezone.utc)
     )
 
-    embed.add_field(name="Price", value=f"${round(price,2)}", inline=True)
-    embed.add_field(name="Target", value=f"🟢 ${target}", inline=True)
-    embed.add_field(name="Stop Loss", value=f"🔴 ${stop}", inline=True)
-    embed.add_field(name="ML Confidence", value=f"{round(prob*100,1)}%", inline=True)
+    embed.add_field(name="Price", value=f"${price:.2f}", inline=True)
+    embed.add_field(name="Target", value=f"${target}", inline=True)
+    embed.add_field(name="Stop Loss", value=f"${stop}", inline=True)
+    embed.add_field(name="ML Confidence", value=f"{prob*100:.1f}%", inline=True)
 
     embed.set_footer(text="Educational use only")
     return embed
@@ -136,13 +132,12 @@ def build_exit_embed(reason, price):
         color=discord.Color.orange(),
         timestamp=datetime.now(timezone.utc)
     )
-
-    embed.add_field(name="Exit Price", value=f"${round(price,2)}", inline=True)
+    embed.add_field(name="Price", value=f"${price:.2f}", inline=True)
     embed.add_field(name="Reason", value=reason, inline=False)
-    embed.set_footer(text="Educational use only")
+    embed.set_footer(text="Trade closed")
     return embed
 
-# ---------- CORE LOGIC ---------- #
+# ================= CORE ================= #
 
 async def check_trade():
     global TRADE_ACTIVE, LAST_DIRECTION
@@ -152,6 +147,10 @@ async def check_trade():
 
     df1m = add_indicators(df1m)
     df15m = add_indicators(df15m)
+
+    if df1m is None or df15m is None:
+        print("⚠️ Not enough data yet")
+        return
 
     price = df1m["Close"].iloc[-1]
     atr = df1m["atr"].iloc[-1]
@@ -170,7 +169,7 @@ async def check_trade():
     if not channel:
         return
 
-    # ---------- ENTRY ---------- #
+    # ENTRY
     if not TRADE_ACTIVE and direction in ["BUY", "SELL"]:
         embed = build_entry_embed(direction, price, prob, atr)
         await channel.send(embed=embed)
@@ -178,7 +177,7 @@ async def check_trade():
         LAST_DIRECTION = direction
         return
 
-    # ---------- EXIT ---------- #
+    # EXIT
     if TRADE_ACTIVE:
         exit_reason = None
 
@@ -188,7 +187,7 @@ async def check_trade():
         elif direction != LAST_DIRECTION:
             exit_reason = "Trend reversal detected"
 
-        if model and prob < 0.55:
+        if prob < 0.55:
             exit_reason = "ML confidence dropped"
 
         if exit_reason:
@@ -197,7 +196,7 @@ async def check_trade():
             TRADE_ACTIVE = False
             LAST_DIRECTION = None
 
-# ---------- LOOP ---------- #
+# ================= LOOP ================= #
 
 @tasks.loop(minutes=1)
 async def spy_loop():
