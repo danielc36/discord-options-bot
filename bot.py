@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands, tasks
 import os
 from dotenv import load_dotenv
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pytz
 import joblib
 import pandas as pd
@@ -21,8 +21,20 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
 SYMBOL = "SPY"
+
+# ================= IMPROVED STATE TRACKING ================= #
 TRADE_ACTIVE = False
 LAST_DIRECTION = None
+ENTRY_PRICE = None
+ENTRY_TIME = None
+LAST_EXIT_TIME = None
+HOLD_COUNTER = 0  # Count consecutive HOLD signals before exiting
+
+# Thresholds
+MIN_ENTRY_CONFIDENCE = 0.65
+MIN_HOLD_CONFIDENCE = 0.50  # Lower threshold to stay in trade
+COOLDOWN_MINUTES = 3  # Wait after exit before new entry
+HOLD_SIGNALS_TO_EXIT = 3  # Need 3 consecutive HOLDs to exit
 
 model = joblib.load("model.pkl")
 print("✅ ML model loaded")
@@ -95,10 +107,12 @@ def determine_direction(df1m, df15m):
     price = df1m["Close"].iloc[-1]
     vwap = df1m["vwap"].iloc[-1]
     adx = df15m["adx"].iloc[-1]
-
-    if price > vwap and adx > 20:
+    stoch_1m = df1m["stoch"].iloc[-1]
+    
+    # Stronger confirmation required
+    if price > vwap and adx > 25 and stoch_1m < 80:  # Not overbought
         return "BUY"
-    elif price < vwap and adx > 20:
+    elif price < vwap and adx > 25 and stoch_1m > 20:  # Not oversold
         return "SELL"
     return "HOLD"
 
@@ -117,30 +131,33 @@ def build_entry_embed(direction, price, prob, atr):
         timestamp=datetime.now(timezone.utc)
     )
 
-    embed.add_field(name="Price", value=f"${price:.2f}", inline=True)
+    embed.add_field(name="Entry Price", value=f"${price:.2f}", inline=True)
     embed.add_field(name="Target", value=f"${target}", inline=True)
     embed.add_field(name="Stop Loss", value=f"${stop}", inline=True)
     embed.add_field(name="ML Confidence", value=f"{prob*100:.1f}%", inline=True)
 
-    embed.set_footer(text="Educational use only")
+    embed.set_footer(text="Educational use only • Position OPENED")
     return embed
 
 
-def build_exit_embed(reason, price):
+def build_exit_embed(reason, price, pnl=None):
     embed = discord.Embed(
-        title="⚠️ SPY EXIT SIGNAL",
+        title="🔔 SPY EXIT SIGNAL",
         color=discord.Color.orange(),
         timestamp=datetime.now(timezone.utc)
     )
-    embed.add_field(name="Price", value=f"${price:.2f}", inline=True)
+    embed.add_field(name="Exit Price", value=f"${price:.2f}", inline=True)
+    if pnl is not None:
+        pnl_emoji = "📈" if pnl > 0 else "📉"
+        embed.add_field(name="P/L", value=f"{pnl_emoji} ${pnl:.2f}", inline=True)
     embed.add_field(name="Reason", value=reason, inline=False)
-    embed.set_footer(text="Trade closed")
+    embed.set_footer(text="Position CLOSED • Wait for next signal")
     return embed
 
 # ================= CORE ================= #
 
 async def check_trade():
-    global TRADE_ACTIVE, LAST_DIRECTION
+    global TRADE_ACTIVE, LAST_DIRECTION, ENTRY_PRICE, ENTRY_TIME, LAST_EXIT_TIME, HOLD_COUNTER
 
     df1m = get_stock_df(SYMBOL, interval="1m")
     df15m = get_stock_df(SYMBOL, interval="15m")
@@ -155,46 +172,88 @@ async def check_trade():
     price = df1m["Close"].iloc[-1]
     atr = df1m["atr"].iloc[-1]
 
-    direction = determine_direction(df1m, df15m)
-
+    # Calculate ML confidence first
     prob = 0
     if model:
         features = build_features(df1m, df15m)
         prob = model.predict_proba(features)[0][1]
 
-        if prob < 0.65:
-            direction = "HOLD"
+    direction = determine_direction(df1m, df15m)
 
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         return
 
-    # ENTRY
-    if not TRADE_ACTIVE and direction in ["BUY", "SELL"]:
-        embed = build_entry_embed(direction, price, prob, atr)
-        await channel.send(embed=embed)
-        TRADE_ACTIVE = True
-        LAST_DIRECTION = direction
+    # ==================== ENTRY LOGIC ==================== #
+    if not TRADE_ACTIVE:
+        # Check cooldown period
+        if LAST_EXIT_TIME:
+            time_since_exit = (datetime.now(timezone.utc) - LAST_EXIT_TIME).total_seconds() / 60
+            if time_since_exit < COOLDOWN_MINUTES:
+                print(f"⏳ Cooldown active ({COOLDOWN_MINUTES - time_since_exit:.1f}min remaining)")
+                return
+
+        # Only enter if direction is clear AND ML is confident
+        if direction in ["BUY", "SELL"] and prob >= MIN_ENTRY_CONFIDENCE:
+            embed = build_entry_embed(direction, price, prob, atr)
+            await channel.send(embed=embed)
+            
+            TRADE_ACTIVE = True
+            LAST_DIRECTION = direction
+            ENTRY_PRICE = price
+            ENTRY_TIME = datetime.now(timezone.utc)
+            HOLD_COUNTER = 0
+            
+            print(f"✅ ENTRY: {direction} @ ${price:.2f} (confidence: {prob*100:.1f}%)")
+        else:
+            print(f"⏸️ No entry: direction={direction}, prob={prob*100:.1f}%")
         return
 
-    # EXIT
+    # ==================== EXIT LOGIC (when in trade) ==================== #
     if TRADE_ACTIVE:
         exit_reason = None
+        
+        # 1. HARD STOP: ML confidence dropped significantly
+        if prob < MIN_HOLD_CONFIDENCE:
+            exit_reason = f"ML confidence dropped to {prob*100:.1f}%"
+        
+        # 2. HARD STOP: Direction reversed completely
+        elif (LAST_DIRECTION == "BUY" and direction == "SELL") or \
+             (LAST_DIRECTION == "SELL" and direction == "BUY"):
+            exit_reason = "Strong reversal detected"
+        
+        # 3. SOFT EXIT: Multiple consecutive HOLD signals
+        elif direction == "HOLD":
+            HOLD_COUNTER += 1
+            print(f"⚠️ HOLD signal {HOLD_COUNTER}/{HOLD_SIGNALS_TO_EXIT}")
+            
+            if HOLD_COUNTER >= HOLD_SIGNALS_TO_EXIT:
+                exit_reason = f"Trend weakened ({HOLD_SIGNALS_TO_EXIT} HOLD signals)"
+        else:
+            # Direction still matches, reset HOLD counter
+            HOLD_COUNTER = 0
+            print(f"✅ Staying in {LAST_DIRECTION} @ ${price:.2f} (confidence: {prob*100:.1f}%)")
 
-        if direction == "HOLD":
-            exit_reason = "Indicators lost confirmation"
-
-        elif direction != LAST_DIRECTION:
-            exit_reason = "Trend reversal detected"
-
-        if prob < 0.55:
-            exit_reason = "ML confidence dropped"
-
+        # Execute exit if triggered
         if exit_reason:
-            exit_embed = build_exit_embed(exit_reason, price)
+            pnl = None
+            if ENTRY_PRICE:
+                if LAST_DIRECTION == "BUY":
+                    pnl = price - ENTRY_PRICE
+                else:  # SELL/PUT
+                    pnl = ENTRY_PRICE - price
+            
+            exit_embed = build_exit_embed(exit_reason, price, pnl)
             await channel.send(embed=exit_embed)
+            
+            print(f"🚪 EXIT: {exit_reason} @ ${price:.2f}")
+            
             TRADE_ACTIVE = False
             LAST_DIRECTION = None
+            ENTRY_PRICE = None
+            ENTRY_TIME = None
+            LAST_EXIT_TIME = datetime.now(timezone.utc)
+            HOLD_COUNTER = 0
 
 # ================= LOOP ================= #
 
@@ -208,7 +267,10 @@ async def spy_loop():
 
 @bot.event
 async def on_ready():
-    print("🚀 SPY ML BOT ONLINE")
+    print("🚀 SPY ML BOT v2.0 ONLINE")
+    print(f"📊 Entry confidence: {MIN_ENTRY_CONFIDENCE*100:.0f}%")
+    print(f"🛡️ Hold confidence: {MIN_HOLD_CONFIDENCE*100:.0f}%")
+    print(f"⏱️ Cooldown: {COOLDOWN_MINUTES}min")
     spy_loop.start()
 
 bot.run(TOKEN)
