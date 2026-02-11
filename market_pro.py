@@ -27,7 +27,7 @@ class DataQualityChecker:
     """Validates data quality before use"""
     
     @staticmethod
-    def check_data_integrity(df: pd.DataFrame, min_rows: int = 50) -> bool:
+    def check_data_integrity(df: pd.DataFrame, min_rows: int = 25) -> bool:
         """Validate dataframe has sufficient quality data"""
         if df is None or df.empty:
             logger.warning("DataFrame is None or empty")
