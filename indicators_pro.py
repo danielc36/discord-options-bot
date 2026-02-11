@@ -51,7 +51,7 @@ class IndicatorSuite:
             # Clean up NaN values
             df = df.dropna()
             
-            if len(df) < 5:
+            if len(df) < 10:
                 logger.warning("Too few rows after indicator calculation")
                 return None
                 
