@@ -18,7 +18,7 @@ class IndicatorSuite:
     """Comprehensive technical indicator calculator"""
     
     def __init__(self):
-        self.min_periods = 50  # Minimum data points needed
+        self.min_periods = 25  # Minimum data points needed
         
     def add_all_indicators(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
         """
