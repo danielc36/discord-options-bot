@@ -70,9 +70,9 @@ class IndicatorSuite:
         # Moving Averages (Multiple Timeframes)
         df["ema_9"] = EMAIndicator(close, window=9).ema_indicator()
         df["ema_21"] = EMAIndicator(close, window=21).ema_indicator()
-        df["ema_50"] = EMAIndicator(close, window=50).ema_indicator()
+        # df["ema_50"] = EMAIndicator(close, window=50).ema_indicator()
         df["sma_20"] = SMAIndicator(close, window=20).sma_indicator()
-        df["sma_200"] = SMAIndicator(close, window=200).sma_indicator()
+        # df["sma_200"] = SMAIndicator(close, window=200).sma_indicator()
         
         # MACD
         macd = MACD(close)
