@@ -378,14 +378,14 @@ async def check_for_signals():
         if signals_sent_today >= MAX_SIGNALS_PER_DAY:
             logger.debug(f"Daily signal limit reached ({MAX_SIGNALS_PER_DAY})")
             return
-        
-    # Fetch data (1m = today, 15m = 5 days for enough history)
-df1m = market_data.get_stock_data(SYMBOL, interval="1m", period="1d")
-df15m = market_data.get_stock_data(SYMBOL, interval="15m", period="5d")
 
-if df1m is None or df15m is None:
-    logger.warning("Failed to fetch data")
-    return
+        # Fetch data (1m = today, 15m = 5 days for enough history)
+        df1m = market_data.get_stock_data(SYMBOL, interval="1m", period="1d")
+        df15m = market_data.get_stock_data(SYMBOL, interval="15m", period="5d")
+
+        if df1m is None or df15m is None:
+            logger.warning("Failed to fetch data")
+            return
         
         # Add indicators
         df1m = indicator_suite.add_all_indicators(df1m)
